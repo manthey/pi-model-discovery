@@ -4,7 +4,7 @@ import { FALLBACK_CONFIG, loadModelDiscoveryConfig } from './config';
 import { isModelDiscoveryState, buildPersistedState } from './state';
 import { updateStatus } from './ui';
 import { registerCommands } from './commands';
-import { performSync } from './sync';
+import { performSync, fetchActiveContextLimits } from './sync';
 import { snapshotFromState, type ModelSnapshot } from './widget';
 import { writeFileSync, existsSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
@@ -22,6 +22,8 @@ const modelDiscoveryExtension = async (pi: ExtensionAPI) => {
   let ollamaReachable = false;
   let syncedAt: number | undefined = undefined;
   let activeCtx: ExtensionContext | null = null;
+  let activeCtxLimitSyncInterval = undefined as any;
+  let checkedModelsLimitMap = new Map<string, boolean>();
 
   const persist = (state: ModelDiscoveryState) => {
     const snapshot = JSON.stringify({ ...state, timestamp: 0 });
@@ -71,6 +73,31 @@ const modelDiscoveryExtension = async (pi: ExtensionAPI) => {
 
   const actions = {
     persistState: () => persist(buildPersistedState(enabled, debugEnabled, lastSync)),
+    updateActiveContextLimits: async () => {
+      const ollamaCfg = currentConfig.providers?.ollama;
+      if (enabled && ollamaReachable) {
+        const baseUrl = (ollamaCfg?.baseUrl ?? 'http://127.0.0.1:11434').replace(/\/$/, '');
+        try {
+          const activeLimits = await fetchActiveContextLimits(baseUrl);
+          let updated = false;
+
+          if (lastSync?.ollama) {
+            const windowsCopy = { ...lastSync.ollama.contextWindows };
+            for (const [name, limit] of Object.entries(activeLimits)) {
+              if (typeof limit === 'number' && (!windowsCopy[name] || limit < windowsCopy[name])) {
+                windowsCopy[name] = limit;
+                updated = true;
+              }
+            }
+            if (updated) {
+              const newState = { ...lastSync, ollama: { ...lastSync.ollama, contextWindows: windowsCopy } };
+              actions.persistLastSync(newState);
+              refreshStatus();
+            }
+          }
+        } catch {} // best-effort network call
+      }
+    },
     persistLastSync: (next: ModelDiscoveryState['lastSync']) => {
       lastSync = next;
       syncedAt = Date.now();
@@ -186,6 +213,12 @@ const modelDiscoveryExtension = async (pi: ExtensionAPI) => {
       }
     }
 
+    // Start a lightweight background watcher to apply newly enforced Ollama limits dynamically.
+    activeCtxLimitSyncInterval = setInterval(actions.updateActiveContextLimits, 30_000);
+
+    // Run an immediate check so any models that load during session start get updated right away
+    actions.updateActiveContextLimits();
+
     refreshStatus();
     if (debugEnabled) ctx.ui.notify('Providers initialized.', 'info');
   });
@@ -195,11 +228,22 @@ const modelDiscoveryExtension = async (pi: ExtensionAPI) => {
       try { updateStatus(activeCtx, { current: null, totalRegistered: 0, thinkingLevel: null }, false); } catch {}
     }
     activeCtx = null;
+    if (activeCtxLimitSyncInterval) clearInterval(activeCtxLimitSyncInterval);
   });
 
   pi.on('model_select', async (event, ctx) => {
     currentModelRef = `${event.model.provider}/${event.model.id}`;
     activeCtx = ctx;
+
+    if (enabled && event.model.id) {
+      const modelName = event.model.id as string;
+      // Track that we've checked the limit for this model to avoid redundant checks later
+      if (!checkedModelsLimitMap.has(modelName)) {
+        checkedModelsLimitMap.set(modelName, true);
+        actions.updateActiveContextLimits();
+      }
+    }
+
     refreshStatus();
   });
 

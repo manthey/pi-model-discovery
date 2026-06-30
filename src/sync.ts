@@ -18,6 +18,31 @@ interface OllamaTagDetails {
   context_length?: number;
   embedding_length?: number;
 }
+export interface OllamaActiveModel {
+  name: string;
+  status: 'loading' | 'loaded' | 'unloading';
+  context_length?: number;
+}
+
+/** Fetch active / enforced context limits from the running Ollama server via api/ps. */
+export const fetchActiveContextLimits = async (baseUrl: string): Promise<Record<string, number>> => {
+  try {
+    const res = await fetch(`${baseUrl}/api/ps`);
+    if (!res.ok) return {};
+    const data = await res.json() as any;
+    // Ollama returns `models` array at the root of api/ps response.
+    const liveModels: OllamaActiveModel[] = Array.isArray(data.models) ? data.models : [];
+    const activeLimits: Record<string, number> = {};
+    for (const m of liveModels) {
+      if (typeof m.context_length === 'number') {
+        // The server-enforced limit is authoritative. It may be lower than the manifest static default
+        // if Ollama is running with a forced CONTEXT_LENGTH or memory management limits.
+        activeLimits[m.name] = m.context_length;
+      }
+    }
+    return activeLimits;
+  } catch { return {}; }
+};
 
 interface OllamaTagEntry {
   name: string;
@@ -214,6 +239,9 @@ const syncOllama = async (pi: ExtensionAPI, config: SyncOptions): Promise<SyncRe
     writeCache(cache);
   }
 
+  // Fetch currently active limits from the running models on the Ollama server.
+  const activeLimits = await fetchActiveContextLimits(baseUrl);
+
   // Build capability lists + per-model maps from the cache (always current).
   const modelIds: string[] = [];
   const vision: string[] = [];
@@ -240,7 +268,12 @@ const syncOllama = async (pi: ExtensionAPI, config: SyncOptions): Promise<SyncRe
     if (caps.embedding) embedding.push(m.name);
     if (caps.remote) remote.push(m.name);
     if (caps.qat) qat.push(m.name);
-    contextWindows[m.name] = caps.contextWindow;
+
+    // Use active server-enforced limit for context window if available, otherwise use the cached manifest default.
+    // The functional limit from api/ps is authoritative because server-side management (e.g., env vars or UI selectors)
+    // may enforce a lower maximum even though the model manifest supports more.
+    const effectiveWindow = activeLimits[m.name] ?? caps.contextWindow;
+    contextWindows[m.name] = effectiveWindow;
     if (caps.family) families[m.name] = caps.family;
     if (caps.parameterSize) parameterSizes[m.name] = caps.parameterSize;
     if (caps.quantization) quantizations[m.name] = caps.quantization;
@@ -262,7 +295,7 @@ const syncOllama = async (pi: ExtensionAPI, config: SyncOptions): Promise<SyncRe
         : { off: null, minimal: null, low: null, medium: null, high: null, xhigh: null },
       input: (caps.vision ? ['text', 'image'] : ['text']) as ('text' | 'image')[],
       cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-      contextWindow: caps.contextWindow,
+      contextWindow: effectiveWindow,
       maxTokens: 4096,
     };
   });
