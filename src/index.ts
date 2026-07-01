@@ -27,6 +27,22 @@ const modelDiscoveryExtension = async (pi: ExtensionAPI) => {
   // when active context limits change without re-fetching /api/tags.
   let cachedOllamaCapabilities: Record<string, ModelCapabilities> | null = null;
 
+  // Track whether we've verified each model's context limit via api/ps.
+  // When a model is selected or session starts, it may not be loaded yet so
+  // won't appear in api/ps — we recheck after the first provider request.
+  let seenModelCtxLimits: Set<string> | null = null;
+
+  /** Check if we have already verified this model exists in active server state. */
+  const hasSeenModelContextLimit = (modelName: string): boolean => {
+    return seenModelCtxLimits?.has(modelName) ?? false;
+  };
+
+  /** Record that we've seen a model's context limit in the server response. */
+  const markModelSeen = (modelName: string): void => {
+    if (!seenModelCtxLimits) seenModelCtxLimits = new Set();
+    seenModelCtxLimits.add(modelName);
+  };
+
   const persist = (state: ModelDiscoveryState) => {
     const snapshot = JSON.stringify({ ...state, timestamp: 0 });
     if (snapshot === lastPersistedSnapshot) return;
@@ -104,6 +120,8 @@ const modelDiscoveryExtension = async (pi: ExtensionAPI) => {
         let needsUpdate = false;
 
         for (const [name, limit] of Object.entries(activeLimits)) {
+          // Mark all found models as seen so we don't recheck on every provider request.
+          markModelSeen(name);
           if (typeof limit === 'number' && limit < (windowsCopy[name] ?? Infinity)) {
             windowsCopy[name] = limit;
             needsUpdate = true;
@@ -350,6 +368,21 @@ const modelDiscoveryExtension = async (pi: ExtensionAPI) => {
     }
 
     refreshStatus();
+  });
+
+  // After the agent makes its first request, re-check context limits for any
+  // ollama model that wasn't loaded during session_start (and thus didn't appear
+  // in api/ps the first time we checked).
+  pi.on('before_provider_request', async (event) => {
+    if (!enabled || !currentModelRef) return;
+    const parts = currentModelRef.split('/');
+    if (parts.length < 2 || parts[0] !== 'ollama') return;
+    const modelName = parts[1];
+
+    // Only trigger the recheck once, for models we haven't verified yet
+    if (!hasSeenModelContextLimit(modelName)) {
+      await actions.updateActiveContextLimits();
+    }
   });
 
   pi.on('thinking_level_select', async (event, ctx) => {
