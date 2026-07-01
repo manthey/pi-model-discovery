@@ -61,6 +61,7 @@ interface OllamaTagsResponse {
   models: OllamaTagEntry[];
 }
 
+/** Model capabilities and metadata from sync — used to rebuild provider configs dynamically. */
 export interface ModelCapabilities {
   vision: boolean;
   reasoning: boolean;
@@ -71,6 +72,7 @@ export interface ModelCapabilities {
   parameterSize?: string;
   family?: string;
   quantization?: string;
+  /** The format field from the tag details (e.g., 'GGUF', 'F32'). */
   format?: string;
   size: number;
   digest: string;
