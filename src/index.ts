@@ -23,25 +23,12 @@ const modelDiscoveryExtension = async (pi: ExtensionAPI) => {
   let syncedAt: number | undefined = undefined;
   let activeCtx: ExtensionContext | null = null;
 
-  // Cache of per-model capabilities built during the last sync so we can rebuild models
-  // when active context limits change without re-fetching /api/tags.
+  // Cached capabilities from last sync — used to rebuild provider configs when active
+  // context limits change without re-fetching /api/tags.
   let cachedOllamaCapabilities: Record<string, ModelCapabilities> | null = null;
 
-  // Track whether we've verified each model's context limit via api/ps.
-  // When a model is selected or session starts, it may not be loaded yet so
-  // won't appear in api/ps — we recheck after the first provider request.
-  let seenModelCtxLimits: Set<string> | null = null;
-
-  /** Check if we have already verified this model exists in active server state. */
-  const hasSeenModelContextLimit = (modelName: string): boolean => {
-    return seenModelCtxLimits?.has(modelName) ?? false;
-  };
-
-  /** Record that we've seen a model's context limit in the server response. */
-  const markModelSeen = (modelName: string): void => {
-    if (!seenModelCtxLimits) seenModelCtxLimits = new Set();
-    seenModelCtxLimits.add(modelName);
-  };
+  // Track which models have been observed at their server-enforced limits via api/ps.
+  let seenContextLimits: Set<string> | null = null;
 
   const persist = (state: ModelDiscoveryState) => {
     const snapshot = JSON.stringify({ ...state, timestamp: 0 });
@@ -91,11 +78,6 @@ const modelDiscoveryExtension = async (pi: ExtensionAPI) => {
 
   const actions = {
     persistState: () => persist(buildPersistedState(enabled, debugEnabled, lastSync)),
-    /**
-     * Check Ollama's api/ps for active model context limits. If any found to be lower than
-     * our cached values, rebuild the provider config with updated windows and re-register it
-     * so compaction uses the correct limits.
-     */
     updateActiveContextLimits: async (): Promise<boolean> => {
       const ollamaCfg = currentConfig.providers?.ollama;
       if (!enabled || !ollamaReachable || !lastSync?.ollama) {
@@ -103,124 +85,90 @@ const modelDiscoveryExtension = async (pi: ExtensionAPI) => {
       }
 
       const baseUrl = (ollamaCfg?.baseUrl ?? 'http://127.0.0.1:11434').replace(/\/$/, '');
-      try {
-        const activeLimits = await fetchActiveContextLimits(baseUrl);
+      const activeLimits = await fetchActiveContextLimits(baseUrl);
 
-        if (!activeLimits || Object.keys(activeLimits).length === 0) {
-          // No active models on server — no update needed yet
-          return false;
-        }
-
-        if (!lastSync.ollama.contextWindows) {
-          return false; // Nothing to compare against
-        }
-
-        // Check if any active limit is lower than what we have
-        const windowsCopy = { ...lastSync.ollama.contextWindows };
-        let needsUpdate = false;
-
-        for (const [name, limit] of Object.entries(activeLimits)) {
-          // Mark all found models as seen so we don't recheck on every provider request.
-          markModelSeen(name);
-          if (typeof limit === 'number' && limit < (windowsCopy[name] ?? Infinity)) {
-            windowsCopy[name] = limit;
-            needsUpdate = true;
-          }
-        }
-
-        // If nothing changed or no update needed, don't do anything.
-        if (!needsUpdate) {
-          return false;
-        }
-
-        // Rebuild and re-register the provider with updated context windows
-        await actions.rebuildAndResyncOllama(windowsCopy);
-        return true; // Indicate we successfully updated something
-      } catch (err) {
-        if (debugEnabled) console.error('[Providers] Error fetching active context limits:', err);
+      if (!lastSync.ollama.contextWindows) {
         return false;
       }
+
+      let needsUpdate = false;
+      const windowsCopy = { ...lastSync.ollama.contextWindows };
+
+      for (const [name, limit] of Object.entries(activeLimits)) {
+        if (typeof limit === 'number' && limit < (windowsCopy[name] ?? Infinity)) {
+          windowsCopy[name] = limit;
+          needsUpdate = true;
+        }
+      }
+
+      if (!needsUpdate) {
+        return false;
+      }
+
+      // Track that we've observed these models at their current limits.
+      if (!seenContextLimits) seenContextLimits = new Set();
+      for (const name of Object.keys(activeLimits)) {
+        seenContextLimits.add(name);
+      }
+
+      return actions.rebuildAndResyncOllama(windowsCopy);
     },
 
-    /** Re-sync Ollama models with updated context windows using cached capabilities data. */
-    rebuildAndResyncOllama: async (newContextWindows: Record<string, number>) => {
+    rebuildAndResyncOllama: async (newContextWindows: Record<string, number>): Promise<boolean> => {
       if (!lastSync?.ollama || !cachedOllamaCapabilities) {
-        return;
+        return false;
       }
 
       const ollamaCfg = currentConfig.providers?.ollama;
       const baseUrl = (ollamaCfg?.baseUrl ?? 'http://127.0.0.1:11434').replace(/\/$/, '');
 
-      try {
-        // Rebuild the model array using cached capabilities and new context windows
-        const models = lastSync.ollama.modelIds.map((modelName) => {
-          const caps = cachedOllamaCapabilities![modelName];
-          if (!caps) return null;
+      if (!cachedOllamaCapabilities) return false;
+      const models = lastSync.ollama.modelIds.map((modelName) => {
+        const caps = cachedOllamaCapabilities![modelName];
+        if (!caps) return null;
 
-          // Use the server-enforced limit for this model if we have it
-          const effectiveWindow = newContextWindows[modelName] ?? caps.contextWindow;
+        const effectiveWindow = newContextWindows[modelName] ?? caps.contextWindow;
+        const displayName = caps.parameterSize
+          ? `${modelName} (${caps.parameterSize})`
+          : modelName;
 
-          const displayName = caps.parameterSize
-            ? `${modelName} (${caps.parameterSize})`
-            : modelName;
-
-          return {
-            id: modelName,
-            name: displayName,
-            reasoning: caps.reasoning,
-            thinkingLevelMap: caps.reasoning
-              ? { off: null, minimal: 'low', low: 'low', medium: 'medium', high: 'high' }
-              : { off: null, minimal: null, low: null, medium: null, high: null },
-            input: (caps.vision ? ['text', 'image'] : ['text']) as ('text' | 'image')[],
-            cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-            contextWindow: effectiveWindow,
-            maxTokens: 4096,
-          };
-        }).filter((m): m is NonNullable<typeof m> => m !== null);
-
-        if (models.length === 0) {
-          return;
-        }
-
-        // Re-register the Ollama provider with updated models.
-        pi.registerProvider('ollama', {
-          baseUrl: baseUrl + '/v1',
-          apiKey: 'ollama',
-          api: 'openai-completions',
-          models,
-        });
-
-        // Update our local state with the new context windows
-        const newState = {
-          ...lastSync,
-          ollama: { ...lastSync.ollama, contextWindows: newContextWindows },
+        return {
+          id: modelName,
+          name: displayName,
+          reasoning: caps.reasoning,
+          thinkingLevelMap: caps.reasoning
+            ? { off: null, minimal: 'low', low: 'low', medium: 'medium', high: 'high' }
+            : { off: null, minimal: null, low: null, medium: null, high: null },
+          input: (caps.vision ? ['text', 'image'] : ['text']) as ('text' | 'image')[],
+          cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+          contextWindow: effectiveWindow,
+          maxTokens: 4096,
         };
-        lastSync = newState;
-        syncedAt = Date.now();
-        persist(buildPersistedState(enabled, debugEnabled, lastSync));
+      }).filter((m): m is NonNullable<typeof m> => m !== null);
 
-        if (debugEnabled) {
-          // Collect models that had their limits lowered (comparing server limit vs manifest default)
-          const baseUrl2 = (ollamaCfg?.baseUrl ?? 'http://127.0.0.1:11434').replace(/\/$/, '');
-          try {
-            const latestActiveLimits = await fetchActiveContextLimits(baseUrl2);
-            const updatedModels: string[] = [];
-            for (const [m, limit] of Object.entries(latestActiveLimits ?? {})) {
-              if (typeof limit === 'number' && cachedOllamaCapabilities?.[m]) {
-                const original = cachedOllamaCapabilities[m].contextWindow;
-                if (limit < original) {
-                  updatedModels.push(`- ${m}: ${limit} (was ${original})`);
-                }
-              }
-            }
-            if (updatedModels.length > 0) {
-              console.log('[Providers] Updated context windows:', updatedModels.join(', '));
-            }
-          } catch {}
-        }
-      } catch (err) {
-        if (debugEnabled) console.error('[Providers] Error rebuilding provider:', err);
+      if (!models.length) {
+        return false;
       }
+
+      pi.registerProvider('ollama', { baseUrl: baseUrl + '/v1', apiKey: 'ollama', api: 'openai-completions', models });
+      lastSync = { ...lastSync, ollama: { ...lastSync.ollama, contextWindows: newContextWindows } };
+      syncedAt = Date.now();
+      persist(buildPersistedState(enabled, debugEnabled, lastSync));
+
+      if (debugEnabled) {
+        const changedModels = Object.entries(newContextWindows)
+          .filter(([m, limit]) => {
+            const caps = cachedOllamaCapabilities?.[m];
+            return typeof limit === 'number' && !!caps && caps.contextWindow > limit;
+          })
+          .map(([m, l]) => `${m}: ${l}`);
+
+        if (changedModels.length) {
+          console.log('[Providers] Updated context windows:', changedModels.join(', '));
+        }
+      }
+
+      return true;
     },
 
     persistLastSync: (next: ModelDiscoveryState['lastSync']) => {
@@ -340,8 +288,7 @@ const modelDiscoveryExtension = async (pi: ExtensionAPI) => {
       }
     }
 
-    // Run an immediate check so any models that loaded during session start get updated right away.
-    // We do this once at startup rather than with a periodic interval to avoid unnecessary traffic.
+    // Check active limits — loads from session_start are now visible.
     actions.updateActiveContextLimits();
 
     refreshStatus();
@@ -359,10 +306,6 @@ const modelDiscoveryExtension = async (pi: ExtensionAPI) => {
     currentModelRef = `${event.model.provider}/${event.model.id}`;
     activeCtx = ctx;
 
-    // Check for updated context limits whenever a new ollama model is selected.
-    // This allows pi to use the correct compaction threshold even if the server
-    // enforces a lower limit via CONTEXT_LENGTH or memory management.
-    // We only do this for ollama and only during an active session.
     if (enabled && event.model.provider === 'ollama' && event.model.id) {
       await actions.updateActiveContextLimits();
     }
@@ -370,17 +313,14 @@ const modelDiscoveryExtension = async (pi: ExtensionAPI) => {
     refreshStatus();
   });
 
-  // After the agent makes its first request, re-check context limits for any
-  // ollama model that wasn't loaded during session_start (and thus didn't appear
-  // in api/ps the first time we checked).
+  // Re-check any model that missed the initial api/ps (e.g., loaded after session_start).
   pi.on('before_provider_request', async (event) => {
     if (!enabled || !currentModelRef) return;
     const parts = currentModelRef.split('/');
-    if (parts.length < 2 || parts[0] !== 'ollama') return;
-    const modelName = parts[1];
+    const modelName = parts.length > 1 ? parts[1] : '';
+    if (!parts[0] || parts[0] !== 'ollama' || !modelName) return;
 
-    // Only trigger the recheck once, for models we haven't verified yet
-    if (!hasSeenModelContextLimit(modelName)) {
+    if (!seenContextLimits?.has(modelName)) {
       await actions.updateActiveContextLimits();
     }
   });
@@ -392,7 +332,7 @@ const modelDiscoveryExtension = async (pi: ExtensionAPI) => {
   });
 };
 
-/** Extract per-model capabilities from sync result for later use in rebuilds. */
+/** Build capability map from the last /api/tags sync result. */
 function extractCapabilitiesFromTags(result: any): Record<string, ModelCapabilities> | null {
   if (!result?.capabilities?.ollama || !result.capabilities.ollama.modelIds) {
     return null;

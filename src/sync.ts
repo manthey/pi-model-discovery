@@ -24,7 +24,7 @@ export interface OllamaActiveModel {
   context_length?: number;
 }
 
-/** Fetch active / enforced context limits from the running Ollama server via api/ps. */
+/** Get per-model context limits from currently loaded models on the server. */
 export const fetchActiveContextLimits = async (baseUrl: string): Promise<Record<string, number>> => {
   try {
     const res = await fetch(`${baseUrl}/api/ps`);
@@ -35,8 +35,6 @@ export const fetchActiveContextLimits = async (baseUrl: string): Promise<Record<
     const activeLimits: Record<string, number> = {};
     for (const m of liveModels) {
       if (typeof m.context_length === 'number') {
-        // The server-enforced limit is authoritative. It may be lower than the manifest static default
-        // if Ollama is running with a forced CONTEXT_LENGTH or memory management limits.
         activeLimits[m.name] = m.context_length;
       }
     }
@@ -271,9 +269,7 @@ const syncOllama = async (pi: ExtensionAPI, config: SyncOptions): Promise<SyncRe
     if (caps.remote) remote.push(m.name);
     if (caps.qat) qat.push(m.name);
 
-    // Use active server-enforced limit for context window if available, otherwise use the cached manifest default.
-    // The functional limit from api/ps is authoritative because server-side management (e.g., env vars or UI selectors)
-    // may enforce a lower maximum even though the model manifest supports more.
+    // Prefer server-enforced limit over manifest default.
     const effectiveWindow = activeLimits[m.name] ?? caps.contextWindow;
     contextWindows[m.name] = effectiveWindow;
     if (caps.family) families[m.name] = caps.family;
