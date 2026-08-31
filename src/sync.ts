@@ -7,6 +7,7 @@ import {
   readCache, writeCache, isCacheValid, resolveTtl,
   updateCacheEntry, dropStaleCacheEntries,
 } from './cache';
+const DEFAULT_CONTEXT_WINDOW = 128_000;
 
 interface OllamaTagDetails {
   parent_model?: string;
@@ -92,7 +93,7 @@ export const inferCapabilitiesFromName = (modelName: string): ModelCapabilities 
     tools: true,
     embedding: lower.includes('embed'),
     imageGeneration: false,
-    contextWindow: 128000,
+    contextWindow: DEFAULT_CONTEXT_WINDOW,
     size: 0,
     digest: '',
     modifiedAt: '',
@@ -111,7 +112,7 @@ export const capabilitiesFromTag = (tag: OllamaTagEntry): ModelCapabilities => {
     tools: caps.includes('tools'),
     embedding: caps.includes('embedding'),
     imageGeneration: caps.includes('image-generation') || caps.includes('image'),
-    contextWindow: d?.context_length ?? 0,
+    contextWindow: (d?.context_length && d.context_length > 0) ? d.context_length : DEFAULT_CONTEXT_WINDOW,
     parameterSize: d?.parameter_size,
     family: d?.family,
     quantization: d?.quantization_level,
